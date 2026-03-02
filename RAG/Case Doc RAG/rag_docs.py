@@ -10,6 +10,7 @@ from dotenv import load_dotenv
 from langchain_community.vectorstores import Chroma
 from pymongo import MongoClient
 from langchain_groq import ChatGroq
+from difflib import SequenceMatcher
 
 
 load_dotenv()
@@ -31,6 +32,28 @@ dbMongo = client["Rag"]
 collection = dbMongo["Document Storage"]
 
 docs = list(collection.find())
+
+
+def get_available_doc_titles():
+    """Extract unique document titles from the MongoDB collection."""
+    return [doc["title"] for doc in docs if "title" in doc]
+
+
+def fuzzy_match_doc_title(candidate, available_titles, threshold=0.5):
+    """Return the best-matching title from available_titles if similarity
+    meets the threshold, otherwise return None."""
+    if not candidate or not available_titles:
+        return None
+    best_match = None
+    best_score = 0.0
+    for title in available_titles:
+        score = SequenceMatcher(None, candidate, title).ratio()
+        if score > best_score:
+            best_score = score
+            best_match = title
+    if best_score >= threshold:
+        return best_match
+    return None
 
 
 template = """
@@ -103,23 +126,19 @@ class GradeDocument(BaseModel):
     )
 
 
-DOC_SELECTOR_SYSTEM_PROMPT = """
+DOC_SELECTOR_SYSTEM_PROMPT_TEMPLATE = """
 You are a legal document-selection classifier for Egyptian civil-case files.
 
 Your job:
 Detect whether the judge's query refers to ANY specific document in the case file.
 
-A "document" includes:
-- صحيفة الدعوى
-- مذكرة دفاع
-- حكم أول درجة
-- حكم الاستئناف
-- طلبات الخصوم
-- محاضر الجلسات
-- تقارير الخبراء
-- إعلانات
-- مستندات رسمية مرفقة
-- أي ورقة لها رقم أو تاريخ داخل ملف الدعوى
+IMPORTANT: The ONLY documents that exist in this case are listed below.
+You MUST NOT invent or guess document names. If the judge refers to a document,
+match it to one of the titles below. If none match, set doc_id to None and
+mode to "no_doc_specified".
+
+Available documents in this case:
+{available_docs}
 
 You MUST classify the query into exactly one category:
 
@@ -146,7 +165,7 @@ You MUST classify the query into exactly one category:
 
 You must return:
 - mode: one of the 3 options
-- doc_id: the detected document title or number, or None
+- doc_id: the EXACT title from the available documents list above, or None
 """
 
 
@@ -300,8 +319,18 @@ def documentSelector(state: AgentState):
 
     query = state.get("query", "").content
 
+    available_titles = get_available_doc_titles()
+    if available_titles:
+        docs_list = "\n".join(f"- {title}" for title in available_titles)
+    else:
+        docs_list = "(No documents available in the case file)"
+
+    system_prompt = DOC_SELECTOR_SYSTEM_PROMPT_TEMPLATE.format(
+        available_docs=docs_list
+    )
+
     messages = [
-        SystemMessage(content=DOC_SELECTOR_SYSTEM_PROMPT),
+        SystemMessage(content=system_prompt),
         HumanMessage(content=query)
     ]
 
@@ -315,6 +344,23 @@ def documentSelector(state: AgentState):
 
     mode = result.mode
     doc_id = result.doc_id
+
+    # Validate that doc_id actually exists in the available documents.
+    # If the LLM returned a doc_id that doesn't match exactly, try fuzzy matching.
+    # If still no match, fall back to no_doc_specified.
+    if doc_id is not None and available_titles:
+        if doc_id not in available_titles:
+            matched = fuzzy_match_doc_title(doc_id, available_titles)
+            if matched:
+                print(f"documentSelector: fuzzy matched '{doc_id}' -> '{matched}'")
+                doc_id = matched
+            else:
+                print(
+                    f"documentSelector: doc_id '{doc_id}' not found in available "
+                    f"documents. Falling back to no_doc_specified."
+                )
+                doc_id = None
+                mode = "no_doc_specified"
 
     state["doc_selection_mode"] = mode
     state["selected_doc_id"] = doc_id
