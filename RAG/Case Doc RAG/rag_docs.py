@@ -1,3 +1,5 @@
+import os
+
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import Chroma
 from langchain_google_genai import ChatGoogleGenerativeAI
@@ -7,7 +9,6 @@ from langgraph.graph import StateGraph, END, START
 from typing import TypedDict, Optional
 from pydantic import Field, BaseModel
 from dotenv import load_dotenv
-from langchain_community.vectorstores import Chroma
 from pymongo import MongoClient
 from langchain_groq import ChatGroq
 from difflib import SequenceMatcher
@@ -15,27 +16,45 @@ from difflib import SequenceMatcher
 
 load_dotenv()
 
+# ---------------------------------------------------------------------------
+# Configuration -- read from env so settings stay consistent with the
+# Supervisor's FileIngestor which writes to the same stores.
+# ---------------------------------------------------------------------------
+_MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017/")
+_MONGO_DB = os.getenv("MONGO_DB", "Rag")
+_MONGO_COLLECTION = os.getenv("MONGO_COLLECTION", "Document Storage")
+_EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "BAAI/bge-large-en-v1.5")
+_CHROMA_COLLECTION = os.getenv("CHROMA_COLLECTION", "judicial_docs")
+_CHROMA_PERSIST_DIR = os.getenv("CHROMA_PERSIST_DIR", "")
 
-embedding_function = HuggingFaceEmbeddings(model_name="BAAI/bge-large-en-v1.5")
+embedding_function = HuggingFaceEmbeddings(model_name=_EMBEDDING_MODEL)
 llm = ChatGroq(model_name="llama-3.3-70b-versatile")
 
+# Build Chroma kwargs -- use persist_directory when configured so that
+# documents indexed by the FileIngestor are visible here.
+_chroma_kwargs = {
+    "collection_name": _CHROMA_COLLECTION,
+    "embedding_function": embedding_function,
+}
+if _CHROMA_PERSIST_DIR:
+    _chroma_kwargs["persist_directory"] = _CHROMA_PERSIST_DIR
 
-db = Chroma(
-    collection_name="judicial_docs",
-    embedding_function=embedding_function,
-)
-retriever = db.as_retriever(search_type="mmr", search_kwargs = {"k": 5})    
+db = Chroma(**_chroma_kwargs)
+retriever = db.as_retriever(search_type="mmr", search_kwargs={"k": 5})
 
 
-client = MongoClient("mongodb://localhost:27017/")
-dbMongo = client["Rag"]
-collection = dbMongo["Document Storage"]
-
-docs = list(collection.find())
+client = MongoClient(_MONGO_URI)
+dbMongo = client[_MONGO_DB]
+collection = dbMongo[_MONGO_COLLECTION]
 
 
 def get_available_doc_titles():
-    """Extract unique document titles from the MongoDB collection."""
+    """Extract unique document titles from the MongoDB collection.
+
+    Queries MongoDB on every call so that documents added dynamically
+    by the FileIngestor (before or during a run) are immediately visible.
+    """
+    docs = list(collection.find({}, {"title": 1}))
     return [doc["title"] for doc in docs if "title" in doc]
 
 
