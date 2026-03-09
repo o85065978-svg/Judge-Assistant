@@ -418,9 +418,12 @@ def retrieve(state: AgentState):
     if doc_target and state.get("doc_selection_mode") == "restrict_to_doc":
         print(f"retrieve: Judge requested info FROM document: {doc_target}")
 
-        docs = retriever.invoke(
+        # Use db.similarity_search with Chroma's filter param directly,
+        # because retriever.invoke() does not support metadata_filter.
+        docs = db.similarity_search(
             query,
-            metadata_filter={"type": doc_target}
+            k=5,
+            filter={"type": doc_target},
         )
         state["retrieved_docs"] = docs
         return state
